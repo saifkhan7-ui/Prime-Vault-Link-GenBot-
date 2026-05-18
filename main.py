@@ -73,7 +73,29 @@ async def unauthorized_user(client: Client, message: Message):
             "Kripya mujhe message ya files na bhejein!"
         )
 
-if __name__ == "__main__":
+# --- 4. WEB SERVER (Hugging Face ko zinda rakhne ke liye) ---
+from aiohttp import web
+import pyrogram
+
+async def handle_web(request):
+    return web.Response(text="Prime Vault Bot is Alive & Running! 🚀")
+
+async def main_engine():
+    # Web Server Start karna (Port 7860)
+    webapp = web.Application()
+    webapp.router.add_get('/', handle_web)
+    runner = web.AppRunner(webapp)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', 7860).start()
+    print("🌐 Web Server Started!")
+
+    # Bot Start karna
     print("🚀 Prime Vault Bot is Starting...")
-    app.run()
+    await app.start()
+    await pyrogram.idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    app.run(main_engine())
+
   
