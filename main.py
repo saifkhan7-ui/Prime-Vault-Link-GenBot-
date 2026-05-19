@@ -1,101 +1,108 @@
+import asyncio
+from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from config import API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL, ADMINS
+import pyrogram
+
+from config import API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL, ADMINS, URL, PORT
 from utils import encode_id, decode_id
 
-app = Client(
-    "PrimeVaultBot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+app = Client("StreamBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- 1. START COMMAND & LINK DECODER (Sabke liye open) ---
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(client: Client, message: Message):
-    text = message.text
-    # Agar start ke sath koi link aayi hai (Link kholne aaya hai)
-    if len(text.split()) > 1:
-        payload = text.split()[1]
-        msg_id = await decode_id(payload)
-        
-        if msg_id > 0:
-            try:
-                await client.copy_message(
-                    chat_id=message.chat.id,
-                    from_chat_id=LOG_CHANNEL,
-                    message_id=msg_id
-                )
-            except Exception as e:
-                await message.reply_text("❌ **File delete ho chuki hai ya link expire ho gayi hai!**")
-        else:
-            await message.reply_text("❌ **Ye link invalid ya corrupt hai!**")
-        return
+# --- 1. WEB SERVER ENGINE (Browser ko file bhejne ke liye) ---
+async def stream_file(request):
+    file_id = request.match_info.get('id')
+    msg_id = decode_id(file_id)
     
-    # Normal Start Command
-    await message.reply_text("👋 **Hello!**\n\nMain Prime Vault ka secure bot hoon. (Aap yahan valid link send karke file le sakte hain).")
-
-
-# --- 2. FILE TO LINK GENERATOR (Sirf ADMINS ke liye) ---
-@app.on_message(filters.private & filters.user(ADMINS) & (filters.document | filters.video | filters.audio | filters.photo))
-async def generate_link(client: Client, message: Message):
+    if msg_id == 0:
+        return web.Response(text="❌ Invalid Link! Ye link galat hai.", status=400)
+    
     try:
-        wait_msg = await message.reply_text("⏳ **Generating Link...**")
+        # Telegram channel se file dhoondhna
+        message = await app.get_messages(LOG_CHANNEL, msg_id)
+        if not message or message.empty:
+            return web.Response(text="❌ File delete ho chuki hai ya nahi mili!", status=404)
         
-        # File ko Log Channel me safe karna
+        # File ka naam aur size nikalna
+        media = message.document or message.video or message.audio
+        file_size = getattr(media, "file_size", 0)
+        file_name = getattr(media, "file_name", "downloaded_file")
+
+        # Browser ko batana ki file download karni hai
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                'Content-Type': 'application/octet-stream',
+                'Content-Disposition': f'attachment; filename="{file_name}"',
+                'Content-Length': str(file_size)
+            }
+        )
+        await response.prepare(request)
+        
+        # Telegram se tukdo (chunks) me data nikal kar browser ko bhejna
+        async for chunk in app.stream_media(message):
+            await response.write(chunk)
+        
+        await response.write_eof()
+        return response
+    except Exception as e:
+        print(f"Streaming Error: {e}")
+        return web.Response(text="❌ Streaming Server Error!", status=500)
+
+# Render ka Health Check Route
+async def index(request):
+    return web.Response(text="Prime Vault Stream Server is Alive! 🚀")
+
+
+# --- 2. TELEGRAM BOT ENGINE (Direct Link Generate karne ke liye) ---
+@app.on_message(filters.private & filters.user(ADMINS) & (filters.document | filters.video | filters.audio))
+async def generate_stream_link(client: Client, message: Message):
+    if not URL:
+        await message.reply_text("❌ **URL Missing:** Pehle config me Render ka link set karo!")
+        return
+        
+    wait_msg = await message.reply_text("⏳ **Uploading to Stream Server...**")
+    try:
+        # File ko LOG_CHANNEL me save karna
         copied_msg = await message.copy(LOG_CHANNEL)
         
-        # Apne 'pv-' stamp wala encrypter call karna
-        encoded_string = await encode_id(copied_msg.id)
-        bot_info = await client.get_me()
+        # ID ko encrypt karna
+        file_id = encode_id(copied_msg.id)
         
-        # Final Link
-        link = f"https://t.me/{bot_info.username}?start={encoded_string}"
+        # Render wale base URL se download link banana
+        base_url = URL.rstrip('/')
+        download_link = f"{base_url}/download/{file_id}"
         
         await wait_msg.edit_text(
-            f"✅ **File Indexed Successfully!**\n\n"
-            f"📁 **Name:** `{message.document.file_name if message.document else 'Media File'}`\n\n"
-            f"🔗 **Direct Link:**\n`{link}`",
+            f"✅ **Direct Download Link Generated!**\n\n"
+            f"📁 **Name:** `{getattr(message.document or message.video or message.audio, 'file_name', 'Media File')}`\n\n"
+            f"🔗 **Fast Download Link:**\n`{download_link}`\n\n"
+            f"*(Ye link browser, IDM, aur ADM me direct chalegi!)*",
             disable_web_page_preview=True
         )
     except Exception as e:
-        await message.reply_text(f"❌ **Error:** `{e}`")
+        await wait_msg.edit_text(f"❌ **Error:** `{e}`")
 
 
-# --- 3. ALERT FOR OTHER USERS (Jo Admin nahi hain) ---
-@app.on_message(filters.private & ~filters.user(ADMINS))
-async def unauthorized_user(client: Client, message: Message):
-    # Agar message /start nahi hai, tabhi warning do (warna upar wala start trigger hoga)
-    if not message.text or not message.text.startswith("/start"):
-        await message.reply_text(
-            "⛔ **Access Denied!**\n\n"
-            "Main ek Private Bot hoon aur sirf apne Admin (Prime Vault) ke liye kaam karta hoon. "
-            "Kripya mujhe message ya files na bhejein!"
-        )
-
-# --- 4. WEB SERVER (Hugging Face ko zinda rakhne ke liye) ---
-from aiohttp import web
-import pyrogram
-
-async def handle_web(request):
-    return web.Response(text="Prime Vault Bot is Alive & Running! 🚀")
-
-async def main_engine():
-    # Web Server Start karna (Port 7860)
-    webapp = web.Application()
-    webapp.router.add_get('/', handle_web)
-    runner = web.AppRunner(webapp)
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 7860).start()
-    print("🌐 Web Server Started!")
-
-    # Bot Start karna
-    print("🚀 Prime Vault Bot is Starting...")
+# --- 3. DUAL STARTUP (Bot + Web Server dono ek sath chalana) ---
+async def main():
     await app.start()
+    print("🚀 Telegram Bot Started!")
+    
+    # Web Server setup
+    server = web.Application()
+    server.router.add_get('/', index)
+    server.router.add_get('/download/{id}', stream_file)
+    
+    runner = web.AppRunner(server)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', PORT).start()
+    print(f"🌐 Web Server Started on Port {PORT}!")
+    
     await pyrogram.idle()
+    
+    await runner.cleanup()
     await app.stop()
 
 if __name__ == "__main__":
-    app.run(main_engine())
-
-  
+    app.run(main())
